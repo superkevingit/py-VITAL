@@ -154,7 +154,7 @@ def GAN_pretrain(model, GAN_model, criterion, optimizer, pos_feats, maxiter):
         L = torch.sum(E, 1)
         Y = torch.div(E, L.repeat(2, 1).permute(1, 0))
         prob_k[k] = torch.sum(Y, dim=0)[0]
-        print('mask {}, value: {:.3f}'.format(k, prob_k[k][0]))
+        # print('mask {}, value: {:.3f}'.format(k, prob_k[k][0]))
     _, idx = torch.min(prob_k, 0)
     row = int(math.floor(idx/3))
     col = idx % 3
@@ -198,6 +198,139 @@ def GAN_pretrain(model, GAN_model, criterion, optimizer, pos_feats, maxiter):
         objective[:, iter] = loss.item() / GAN_batch_size
 
         # objective[iter] =
+        print "Iter %d, Loss %.4f, Time %.3f" % (iter+1, torch.mean(objective[:,0:iter+1], dim=1).data, time.time()-tic)
+
+
+def train_update(model, GAN_model, criterion, GAN_criterion, optimizer, GAN_optimizer, pos_feats, neg_feats, maxiter, in_layer='fc4'):
+    batch_pos = opts['batch_pos']
+    batch_neg = opts['batch_neg']
+    batch_test = opts['batch_test']
+    batch_neg_cand = max(opts['batch_neg_cand'], batch_neg)
+
+    pos_idx = np.random.permutation(pos_feats.size(0))
+    neg_idx = np.random.permutation(neg_feats.size(0))
+    while(len(pos_idx) < batch_pos*maxiter):
+        pos_idx = np.concatenate([pos_idx, np.random.permutation(pos_feats.size(0))])
+    while(len(neg_idx) < batch_neg_cand*maxiter):
+        neg_idx = np.concatenate([neg_idx, np.random.permutation(neg_feats.size(0))])
+    pos_pointer = 0
+    neg_pointer = 0
+
+    for iter in range(maxiter):
+        # select pos idx
+        pos_next = pos_pointer+batch_pos
+        pos_cur_idx = pos_idx[pos_pointer:pos_next]
+        pos_cur_idx = pos_feats.new(pos_cur_idx).long()
+        pos_pointer = pos_next
+
+        # select neg idx
+        neg_next = neg_pointer+batch_neg_cand
+        neg_cur_idx = neg_idx[neg_pointer:neg_next]
+        neg_cur_idx = neg_feats.new(neg_cur_idx).long()
+        neg_pointer = neg_next
+
+        # create batch
+        batch_pos_feats = Variable(pos_feats.index_select(0, pos_cur_idx))
+        batch_neg_feats = Variable(neg_feats.index_select(0, neg_cur_idx))
+
+        # hard negative mining
+        if batch_neg_cand > batch_neg:
+            model.eval()
+            for start in range(0, batch_neg_cand, batch_test):
+                end = min(start+batch_test, batch_neg_cand)
+                score = model(batch_neg_feats[start:end], in_layer=in_layer)
+                if start==0:
+                    neg_cand_score = score.data[:, 1].clone()
+                else:
+                    neg_cand_score = torch.cat((neg_cand_score, score.data[:, 1].clone()), 0)
+
+            _, top_idx = neg_cand_score.topk(batch_neg)
+            batch_neg_feats = batch_neg_feats.index_select(0, Variable(top_idx))
+
+        # mask positive features using GAN
+        batch_pos_feats_backup = batch_pos_feats.data.clone()
+        GAN_model.eval()
+        feat_asdn = GAN_model(batch_pos_feats).view(-1, 3, 3)
+        num = feat_asdn.shape[0]
+        mask_asdn = torch.ones(num, 512, 3, 3)
+        if opts['use_gpu']:
+            mask_asdn = mask_asdn.cuda()
+        for i in range(num):
+            feat_ = feat_asdn[0, :].data.clone()
+            _, idxlist = torch.topk(feat_, 3, largest=False)
+
+            for j in range(len(idxlist)):
+                idx = idxlist[j]
+                row = int(math.floor(j/3))
+                col = j % 3
+                mask_asdn[:, :, col, row] = 0
+        batch_pos_feats = batch_pos_feats.mul(mask_asdn.view(num, -1))
+
+        # forward
+        model.train()
+        pos_score = model(batch_pos_feats, in_layer=in_layer)
+        neg_score = model(batch_neg_feats, in_layer=in_layer)
+
+        # optimize
+        loss = criterion(pos_score, neg_score)
+        model.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), opts['grad_clip'])
+        optimizer.step()
+
+        print('Finetune: Iter' + str(iter+1) + ', Loss ' + str(loss.item()))
+
+        # --------- train GAN ---------
+        tic = time.time()
+        GAN_mask_batch_size = opts['GAN_batch_size']
+        objective = torch.zeros(1, maxiter)
+        # Evaluate mask
+        print('Evaluating Mask')
+        n = pos_feats.size(0)
+        prob_k = torch.zeros(9, 1)
+        for k in range(0, 9):
+            row = int(math.floor(k/3))
+            col = k % 3
+            batch = batch_pos_feats_backup.data.clone()
+            batch = batch.view(-1, 512, 3, 3)
+            batch[:, :, col, row] = 0
+            batch = batch.view(batch.size(0), -1)
+
+            # prepare label
+            model.eval()
+            feats = model(batch, in_layer='fc4')
+
+            # calcute zero position
+            X = feats
+            X_max = torch.max(feats, dim=1)[0]
+            X_max = X_max.repeat(2, 1).permute(1, 0)
+            E = torch.exp(feats-X_max)
+            L = torch.sum(E, 1)
+            Y = torch.div(E, L.repeat(2, 1).permute(1, 0))
+            prob_k[k] = torch.sum(Y, dim=0)[0]
+            # print('mask {}, value: {:.3f}'.format(k, prob_k[k][0]))
+            _, idx = torch.min(prob_k, 0)
+            row = int(math.floor(idx/3))
+            col = idx % 3
+        # train
+        batch = batch_pos_feats_backup.data.clone()
+        GAN_batch_size = opts['GAN_batch_size']
+        labels = torch.ones(3, 3, 1, GAN_batch_size)
+        labels[col, row, :] = 0
+        if opts['use_gpu']:
+            labels = labels.cuda()
+        GAN_model.train()
+        GAN_score = GAN_model(batch).view(3, 3, 1, GAN_batch_size)
+
+        # optimize
+        GAN_loss = GAN_criterion(GAN_score, labels)
+        GAN_model.zero_grad()
+        GAN_loss.backward()
+        torch.nn.utils.clip_grad_norm_(GAN_model.parameters(), opts['grad_clip'])
+        GAN_optimizer.step()
+
+        # result
+        objective[:, iter] = loss.item() / GAN_batch_size
         print "Iter %d, Loss %.4f, Time %.3f" % (iter+1, torch.mean(objective[:,0:iter+1], dim=1).data, time.time()-tic)
     return
 
@@ -378,12 +511,11 @@ def run_mdnet(seq_name, img_list, init_bbox, gt=None, savefig_dir='', display=Fa
         # Long term update
         elif i % opts['long_interval'] == 0:
             pos_data = torch.stack(pos_feats_all, 0).view(-1, feat_dim)
-            set_trace()
             neg_data = torch.stack(neg_feats_all, 0).view(-1, feat_dim)
             # train(model, criterion, update_optimizer, pos_data, neg_data, opts['maxiter_update'])
-            # train fc using GAN
+            # train fc using GAN -------sky add
             print('long term update with GAN')
-            GAN_train(model, GAN_model, criterion, GAN_criterion, update_optimizer, GAN_update_optimizer, \
+            train_update(model, GAN_model, criterion, GAN_criterion, update_optimizer, GAN_update_optimizer, \
                       pos_data, neg_data, opts['maxiter_update'])
 
         spf = time.time()-tic
